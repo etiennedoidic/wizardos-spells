@@ -1,19 +1,7 @@
 {
   "kind": "tool",
-  "name": "yt-transcribe",
   "description": "A YouTube video's transcript as timestamped JSON, from its captions or whisper as a fallback.",
-  "tags": [
-    "wizardos",
-    "wand",
-    "spell"
-  ],
-  "dependencies": [],
-  "requires": [
-    "yt-dlp",
-    "whisper-cli"
-  ],
-  "permissions": [
-    "net",
-    "exec"
-  ]
+  "requires": ["yt-dlp", "whisper-cli"],
+  "permissions": ["net", "exec"],
+  "tags": ["youtube", "transcript"]
 }
