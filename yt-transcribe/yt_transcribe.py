@@ -1,128 +1,78 @@
-"""yt_transcribe — a YouTube video's transcript, as JSON, filed in Grimoire.
+"""Transcribe a YouTube video.
 
-URL in, transcript out: yt-dlp pulls the caption track, it becomes timestamped
-segments, and a readable note lands in Grimoire's ``yt_transcripts`` chapter.
-
-Captions first, always. YouTube publishes a timed track for essentially every
-video (manual where an uploader wrote one, ASR otherwise), and reading it is a
-metadata fetch — seconds, no model, no audio on disk. Charter § 3: never use
-tier N when N−1 suffices.
-
-The fallback covers the two ways tier 0 comes back empty — no caption track,
-or a rate-limited fetch (HTTP 429). Then yt-dlp pulls the audio and
-whisper.cpp's ``whisper-cli`` transcribes it: tier 1, entered only after tier
-0 actually failed, announced over ``progress`` because it turns a three-second
-job into a minutes-long one. ``source`` records which tier won.
-
-Whisper here is a subprocess that exits, not a resident model: ``base.en`` is
-148 MB and English-only — the fallback's whole scope — so it never contends
-for the 16 GB budget the way an Oracle-managed LLM would, and Charter § 2's
-one-resident-model rule is not in play. No ffmpeg anywhere either; yt-dlp
-extracts the audio itself and whisper-cli decodes mp3 natively.
-
-Nothing here talks to Anthropic, so ``CLAUDE_CODE_OAUTH_TOKEN`` is never read
-and a stale subscription token cannot 401 a transcribe — the failure Ouroboros
-hit twice building this spell is designed out rather than retried. The one
-credential in play is the platform's own ``WIZARD_API_TOKEN``, which the SDK
-loopback client carries to Grimoire — reached over HTTP, never by import
-(Charter § 1), and only through ``POST /chapters`` and ``POST /capture``.
+Read the caption track first. If YouTube has no track, or returns HTTP 429,
+transcribe the audio with whisper-cli. Print the text and write JSON to the
+cache directory.
 """
 
 from __future__ import annotations
 
-import asyncio
+import argparse
 import json
 import os
 import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
-
-from wizardos.sdk import App
-
-from apps.wand.core.spells import spell
-
-app_sdk = App("wand")
-
-
-CHAPTER = "yt_transcripts"
-CHAPTER_ICON = "🎬"
-CHAPTER_DESCRIPTION = (
-    "Transcripts of YouTube videos, captured by the wand yt_transcribe "
-    "spell. Each entry is one video: title, channel, source URL and the "
-    "spoken text in timestamped blocks."
-)
-
-# Grimoire's CaptureIn caps content at 100k characters, which a long enough
-# video (roughly four hours of speech) overruns — so the note is trimmed to
-# fit. The transcript is never lost: the JSON result and the archive copy hold
-# it untrimmed.
+# Grimoire used to reject a note above this size. Keep the same cut for the text file.
 _MAX_ENTRY_CHARS = 100_000
 
-# Network work is retried, briefly. Anything past a few seconds of trying is
-# a real outage, and that deserves to fail the job rather than hold a worker
-# slot. "This video has no captions" is not retried at all — it is the
-# fallback's cue.
+# Retry a short network fault. A missing caption track starts the audio fallback.
 _ATTEMPTS = 3
 _BACKOFF_S = 2.0
 _TIMEOUT_S = 180
 
-# Audio is a real download, not a metadata fetch, so it gets its own budget.
 _AUDIO_TIMEOUT_S = 900
 
-# whisper.cpp, English-only, 148 MB. Small on purpose: the fallback exists to
-# rescue a job, not to hold a GPU. `wizard-state/models/whisper/` is the
-# platform's weights dir (SDK `models_dir`) — backed up nowhere, re-pullable.
+# Public ggml file, English only, 148 MB. The download needs no token.
 _WHISPER_MODEL = "ggml-base.en.bin"
 _WHISPER_LABEL = "base.en"
 _WHISPER_URL = (
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/" + _WHISPER_MODEL
 )
-# Four of ten cores. The box is headless but it is also serving the PWAs.
 _WHISPER_THREADS = 4
-# Wall clock allowed per cast, scaled by video length. base.en on this M4 runs
-# far faster than realtime, so 1× duration is a hang detector, not a budget.
 _WHISPER_MIN_TIMEOUT_S = 300
 _WHISPER_MAX_TIMEOUT_S = 3600
 
 _PROGRESS_RE = re.compile(r"progress\s*=\s*(\d+)%")
-# yt-dlp's rate-limit line, in either of the shapes it prints it.
 _RATE_LIMITED_RE = re.compile(r"\b429\b|too\s+many\s+requests", re.I)
 _NO_SUBS_RE = re.compile(r"no subtitles|subtitles.{0,20}not available", re.I)
-# whisper.cpp labels non-speech spans instead of leaving them blank. They are
-# not spoken text and would read as noise in the note.
+# whisper.cpp writes these marks for silence. Drop them.
 _NOISE_RE = re.compile(r"^[\[(][^\])]*[\])]$")
+_LANG_RE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})?$")
 
-# In scope: YouTube. Every other host is out.
 _YOUTUBE_HOSTS = {
     "youtube.com", "www.youtube.com", "m.youtube.com",
     "music.youtube.com", "youtu.be", "www.youtu.be",
 }
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _URL_RE = re.compile(r"^https?://([^/:?#]+)(?::\d+)?(/[^?#]*)?(?:\?([^#]*))?", re.I)
+_AUDIO_EXT = {".m4a", ".mp4", ".webm", ".opus", ".ogg", ".mp3", ".wav", ".flac"}
 
 
 class _NoCaptions(Exception):
-    """Tier 0 came back empty — hand off to the audio fallback.
+    """No caption track, or HTTP 429. Start the audio fallback."""
 
-    Deliberately narrow: only "no caption track published" and "rate-limited"
-    raise it. A private video, a dead link or a network outage stays a hard
-    failure, because ten minutes of whisper would not fix any of them.
-    """
+
+def _cache_dir() -> Path:
+    """Return the cache directory. ``YT_TRANSCRIBE_CACHE`` overrides it."""
+    raw = os.environ.get("YT_TRANSCRIBE_CACHE")
+    return Path(raw) if raw else Path.home() / ".cache" / "yt-transcribe"
 
 
 def _video_id(url: str) -> str:
-    """The 11-character video id, or raise with a message worth showing. Takes
-    watch links, youtu.be, /shorts/, /embed/ — what a share sheet produces."""
+    """Return the 11-character video id, or raise ValueError."""
     m = _URL_RE.match(url.strip())
     if not m:
         raise ValueError(f"not a URL: {url!r}")
@@ -147,9 +97,17 @@ def _video_id(url: str) -> str:
     return candidate
 
 
+def _check(url: str, lang: str) -> None:
+    """Reject a bad URL or language code before any network request."""
+    if not (8 <= len(url) <= 2000) or not url.startswith(("http://", "https://")):
+        raise ValueError("url must be an http(s) URL")
+    if not _LANG_RE.match(lang):
+        raise ValueError(f"bad language code: {lang}")
+    _video_id(url)
+
+
 def _cue(start_ms: float, end_ms: float, text: str) -> Dict[str, Any]:
-    """One segment, from whichever source's millisecond clock. Both parsers
-    land here so caption and audio transcripts are one shape downstream."""
+    """Build one segment. Times are milliseconds."""
     start = start_ms / 1000.0
     return {
         "start": round(start, 3),
@@ -159,9 +117,7 @@ def _cue(start_ms: float, end_ms: float, text: str) -> Dict[str, Any]:
 
 
 def _ordered(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Sort cues and clamp each end to the next start. ASR durations overlap
-    the next cue on purpose (a word is still on screen while the next line
-    appears); ordered and non-overlapping is what a seek needs."""
+    """Sort cues. Stop each end at the next start."""
     cues.sort(key=lambda c: c["start"])
     for i, cue in enumerate(cues[:-1]):
         cue["end"] = round(max(cue["start"], min(cue["end"], cues[i + 1]["start"])), 3)
@@ -169,10 +125,7 @@ def _ordered(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _parse_json3(raw: dict) -> List[Dict[str, Any]]:
-    """json3 caption events → segments. Two shapes have to be dropped or the
-    transcript doubles: the leading window-definition event (no ``segs``), and
-    the ``aAppend`` events carrying a bare newline to scroll YouTube's rolling
-    caption box."""
+    """Convert json3 events to segments. Drop window and aAppend events."""
     cues: List[Dict[str, Any]] = []
     for event in raw.get("events") or []:
         if event.get("aAppend"):
@@ -187,13 +140,7 @@ def _parse_json3(raw: dict) -> List[Dict[str, Any]]:
 
 
 def _parse_whisper(raw: dict) -> List[Dict[str, Any]]:
-    """whisper.cpp `-oj` output → the same segments.
-
-    ``offsets`` is milliseconds from the start of the audio, which is the start
-    of the video — yt-dlp extracts the whole track, so whisper's clock is
-    YouTube's clock and the timestamps are directly seekable. The
-    ``timestamps`` strings alongside are the same numbers formatted.
-    """
+    """Convert whisper.cpp JSON to the same segments."""
     cues: List[Dict[str, Any]] = []
     for item in raw.get("transcription") or []:
         text = " ".join((item.get("text") or "").split())
@@ -205,7 +152,7 @@ def _parse_whisper(raw: dict) -> List[Dict[str, Any]]:
 
 
 def _clock(seconds: float) -> str:
-    """`M:SS` under an hour, `H:MM:SS` over it — how people read a timecode."""
+    """Format a time as M:SS, or H:MM:SS after one hour."""
     total = max(0, int(seconds))
     hours, rest = divmod(total, 3600)
     minutes, secs = divmod(rest, 60)
@@ -215,25 +162,16 @@ def _clock(seconds: float) -> str:
 def _run_yt_dlp(
     url: str, workdir: Path, extra: List[str], *,
     timeout_s: int, retry_label: str, gave_up: str,
-    fatal: Callable[[str], None], progress,
+    fatal: Callable[[str], None], progress, out_tmpl: str = "%(id)s",
 ) -> None:
-    """Run yt-dlp into `workdir` with retries; raise if it never succeeds.
-
-    Both fetches share this, including the salvage of yt-dlp's own ERROR line —
-    the useful half of a noisy stderr. `fatal` reads that line and raises when
-    a retry is pointless, the one place the two paths differ: a refused caption
-    fetch has a fallback, a refused audio download does not.
-    ``--write-info-json`` is on both, so metadata comes out of the same
-    extraction and the audio path still has a title when the caption attempt
-    died before writing a sidecar.
-    """
+    """Run yt-dlp in ``workdir``. Retry, then raise. ``fatal`` can stop the retries."""
     binary = shutil.which("yt-dlp")
     if binary is None:
         raise RuntimeError("yt-dlp is not installed — `brew install yt-dlp`")
 
     cmd = [
         binary, "--no-playlist", "--no-progress", "--write-info-json", *extra,
-        "--retries", "3", "-o", str(workdir / "%(id)s"), url,
+        "--retries", "3", "-o", str(workdir / out_tmpl), url,
     ]
 
     last = ""
@@ -259,12 +197,10 @@ def _run_yt_dlp(
 
 
 def _fetch_captions(url: str, lang: str, workdir: Path, progress) -> None:
-    """Captions + metadata into `workdir`, or the fallback's cue."""
+    """Write captions into ``workdir``, or signal the audio fallback."""
 
     def fatal(last: str) -> None:
-        # A 429 is not worth three tries — retrying is what earned it. Go to
-        # the audio fallback immediately: faster, and the one request YouTube
-        # has not already refused.
+        # HTTP 429: do not retry. Start the audio fallback.
         if _RATE_LIMITED_RE.search(last):
             raise _NoCaptions("YouTube rate-limited the caption fetch (HTTP 429)")
         if _NO_SUBS_RE.search(last):
@@ -273,9 +209,9 @@ def _fetch_captions(url: str, lang: str, workdir: Path, progress) -> None:
     _run_yt_dlp(
         url, workdir,
         [
-            "--skip-download",       # no audio or video ever touches the disk
-            "--write-subs",          # a human-written track wins when there is one
-            "--write-auto-subs",     # ASR otherwise
+            "--skip-download",
+            "--write-subs",
+            "--write-auto-subs",
             "--sub-langs", f"{lang},{lang}-orig,{lang}.*",
             "--sub-format", "json3",
         ],
@@ -285,13 +221,7 @@ def _fetch_captions(url: str, lang: str, workdir: Path, progress) -> None:
 
 
 def _pick_subtitles(workdir: Path, video_id: str, lang: str) -> Path:
-    """The best caption file yt-dlp wrote: exact language, then the
-    original-language track, then any regional variant — ``en`` before
-    ``en-orig`` before ``en-GB``.
-
-    Nothing at all is the common no-captions shape: yt-dlp exits 0, warns,
-    and simply writes no ``.json3``. That is a `_NoCaptions`, not an error.
-    """
+    """Pick ``lang``, then ``lang-orig``, then a regional track."""
     files = sorted(workdir.glob(f"{video_id}*.json3"))
     if not files:
         raise _NoCaptions(f"no {lang} caption track published")
@@ -303,13 +233,13 @@ def _pick_subtitles(workdir: Path, video_id: str, lang: str) -> Path:
 
 
 def _track_language(path: Path, video_id: str) -> str:
-    """`<id>.<lang>.json3` → `<lang>`."""
+    """Read the language code from ``<id>.<lang>.json3``."""
     stem = path.name[len(video_id) + 1:]
     return stem[: -len(".json3")] if stem.endswith(".json3") else stem
 
 
 def _info(workdir: Path, video_id: str) -> dict:
-    """yt-dlp's metadata sidecar. Absent metadata is not a failed transcript."""
+    """Read the metadata sidecar. A missing file is an empty dict."""
     sidecar = workdir / f"{video_id}.info.json"
     if not sidecar.exists():
         return {}
@@ -319,68 +249,96 @@ def _info(workdir: Path, video_id: str) -> dict:
         return {}
 
 
+def _ffmpeg() -> Optional[str]:
+    """Return ffmpeg when the binary runs. A broken install returns None."""
+    binary = shutil.which("ffmpeg")
+    if binary is None:
+        return None
+    try:
+        done = subprocess.run([binary, "-version"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return binary if done.returncode == 0 else None
+
+
+def _to_wav(audio: Path, workdir: Path) -> Path:
+    """Make a 16 kHz mono wav. Use ffmpeg, or afconvert when ffmpeg does not run."""
+    wav = workdir / f"{audio.stem}.16k.wav"
+    ffmpeg = _ffmpeg()
+    if ffmpeg is not None:
+        done = subprocess.run(
+            [ffmpeg, "-y", "-i", str(audio), "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav)],
+            capture_output=True, text=True, timeout=600,
+        )
+        if done.returncode == 0 and wav.exists():
+            return wav
+    afconvert = shutil.which("afconvert")
+    if afconvert is not None:
+        done = subprocess.run(
+            [afconvert, "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(audio), str(wav)],
+            capture_output=True, text=True, timeout=600,
+        )
+        if done.returncode == 0 and wav.exists():
+            return wav
+        detail = (done.stderr or done.stdout or "afconvert failed").strip()
+        raise RuntimeError(detail[:300])
+    raise RuntimeError("ffmpeg does not run, and afconvert is not available")
+
+
 def _download_audio(url: str, workdir: Path, video_id: str, progress) -> Path:
-    """The video's audio as mp3 in `workdir`, for whisper to read. It lives in
-    the caller's TemporaryDirectory and dies with it; only the transcript is
-    kept."""
+    """Save the audio as a 16 kHz wav. The temp directory deletes it."""
 
     def fatal(last: str) -> None:
-        # Nothing left to fall back to: captions were refused and so was the
-        # audio. Say which, so waiting is obviously the fix.
         if _RATE_LIMITED_RE.search(last):
             raise RuntimeError(
                 "YouTube rate-limited the audio download too (HTTP 429) — "
-                "wait a few minutes and cast again"
+                "wait a few minutes and run again"
             )
 
     _run_yt_dlp(
         url, workdir,
-        [
-            # The audio stream alone, extracted by yt-dlp's own ffmpeg call.
-            # Quality 5 is VBR ~130 kbps, and whisper resamples to 16 kHz mono
-            # regardless, so anything better is bandwidth spent on nothing.
-            "--extract-audio", "--audio-format", "mp3", "--audio-quality", "5",
-        ],
+        ["-f", "ba[ext=m4a]/140/ba"],
         timeout_s=_AUDIO_TIMEOUT_S, retry_label="audio retry ",
         gave_up="could not download the audio", fatal=fatal, progress=progress,
+        out_tmpl="%(id)s.%(ext)s",
     )
 
-    files = sorted(workdir.glob(f"{video_id}*.mp3"))
+    files = sorted(
+        p for p in workdir.iterdir()
+        if p.is_file() and p.suffix.lower() in _AUDIO_EXT and video_id in p.name
+    )
     if not files:
         raise RuntimeError("yt-dlp reported success but wrote no audio file")
-    return files[0]
+    return _to_wav(files[0], workdir)
 
 
-def _whisper_model() -> Path:
-    """The ggml weights, or how to get them. No auto-pull: a spell should not
-    quietly spend 148 MB of someone's bandwidth mid-job."""
-    path = app_sdk.models_dir / "whisper" / _WHISPER_MODEL
-    if not path.exists():
-        raise RuntimeError(
-            f"whisper model {_WHISPER_MODEL} is not in {path.parent} — fetch it "
-            f"once with:\n  mkdir -p {path.parent} && curl -L -o {path} {_WHISPER_URL}"
-        )
+def _whisper_model(progress) -> Path:
+    """Return the ggml file. Download it once into the cache. No token."""
+    path = _cache_dir() / _WHISPER_MODEL
+    if path.is_file() and path.stat().st_size > 1_000_000:
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    progress(f"downloading {_WHISPER_MODEL}")
+    part = path.with_suffix(".part")
+    try:
+        urllib.request.urlretrieve(_WHISPER_URL, part)
+        part.replace(path)
+    except (OSError, urllib.error.URLError) as exc:
+        part.unlink(missing_ok=True)
+        raise RuntimeError(f"could not download {_WHISPER_MODEL}: {exc}") from exc
     return path
 
 
 def _whisper(
     audio: Path, workdir: Path, duration_s: Optional[float], progress,
 ) -> List[Dict[str, Any]]:
-    """Transcribe `audio` with whisper.cpp. One run, no retry.
-
-    ``-l en`` rather than auto-detect, to match the English-only model. Output
-    goes to a JSON sidecar (``-oj``) rather than being scraped off stdout,
-    because stdout is also where the backend banner and the progress ticks
-    land. Those ticks are worth relaying: this is the step that takes minutes,
-    and a silent job looks like a hung one.
-    """
+    """Transcribe ``audio`` once. Write JSON with ``-oj`` and report progress."""
     binary = shutil.which("whisper-cli")
     if binary is None:
         raise RuntimeError(
-            "whisper.cpp is not installed — `brew install whisper-cpp`. Until "
-            "then yt_transcribe can only read videos that publish captions."
+            "whisper-cli is not installed — `brew install whisper-cpp`"
         )
-    model = _whisper_model()
+    model = _whisper_model(progress)
 
     stem = workdir / f"{audio.stem}.whisper"
     timeout_s = min(
@@ -389,16 +347,11 @@ def _whisper(
     cmd = [
         binary, "-m", str(model), "-f", str(audio), "-l", "en",
         "-t", str(_WHISPER_THREADS), "-oj", "-of", str(stem),
-        "-np",   # results only — the model dump is not progress
-        "-pp",   # …except the percentage, which is
+        "-np",
+        "-pp",
     ]
 
-    # `start_new_session` puts whisper in its own process group so the
-    # watchdog can kill the group. Killing just the child is not enough: any
-    # surviving grandchild still holds the write end of the pipe, the read
-    # loop below never sees EOF, and a timeout turns into the hang it exists
-    # to prevent. Reading stays on this thread — `progress` is a sqlite write
-    # the worker expects from the handler's thread, not from a pump thread.
+    # Kill the process group on timeout. A live child keeps the pipe open.
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, start_new_session=True,
@@ -410,7 +363,7 @@ def _whisper(
         killed.append(True)
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):  # already gone
+        except (ProcessLookupError, PermissionError):
             pass
 
     watchdog = threading.Timer(timeout_s, _stop)
@@ -432,7 +385,7 @@ def _whisper(
                     progress(f"whisper {step}%")
         try:
             code = proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:  # EOF but not reaped — stop it anyway
+        except subprocess.TimeoutExpired:
             _stop()
             code = proc.wait(timeout=30)
     finally:
@@ -457,6 +410,7 @@ def _document(
     *, url: str, video_id: str, info: dict, lang: str,
     segments: List[Dict[str, Any]], source: str = "captions",
 ) -> Dict[str, Any]:
+    """Build the transcript document for one video."""
     upload = str(info.get("upload_date") or "")
     return {
         "video_id": video_id,
@@ -466,15 +420,8 @@ def _document(
         "duration_s": info.get("duration"),
         "published": f"{upload[:4]}-{upload[4:6]}-{upload[6:8]}" if len(upload) == 8 else "",
         "language": lang,
-        # Which tier produced the text. Anything grading it later wants to
-        # know: the two are not equally trustworthy, and only `captions` is
-        # reproducible from a metadata fetch.
         "source": source,
         "model": _WHISPER_LABEL if source == "audio" else "",
-        # An empty `subtitles` map means nobody wrote captions by hand and
-        # what we read is YouTube's ASR — worth recording, because ASR text
-        # is worth trusting less. A whisper transcript is automatic by
-        # definition: no human wrote that either.
         "automatic": source == "audio" or not (info.get("subtitles") or {}).get(lang),
         "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "segment_count": len(segments),
@@ -484,115 +431,41 @@ def _document(
 
 
 def _note(doc: Dict[str, Any]) -> str:
-    """The Grimoire entry: the video's title, then the consolidated text.
-
-    Nothing else — no channel, timestamps or source metadata. The JSON result
-    (and the archive copy on disk) is where those live for anything wanting
-    them.
-    """
+    """Build the note: title, then text."""
     text = doc["text"]
-    limit = _MAX_ENTRY_CHARS - len(doc["title"]) - 1  # +1 for the title's newline
+    limit = _MAX_ENTRY_CHARS - len(doc["title"]) - 1
     if len(text) > limit:
         text = text[: max(0, limit)]
     return f"{doc['title']}\n{text}"
 
 
-def _archive(doc: Dict[str, Any]) -> Optional[Path]:
-    """Keep the untrimmed JSON on wand's own disk. Best effort — a transcript
-    that reached Grimoire is not a failure because the archive copy didn't."""
+def _write_json(doc: Dict[str, Any], out: Optional[Path]) -> Optional[Path]:
+    """Write the full JSON. A disk error does not fail the job."""
     try:
-        out = app_sdk.state_dir / "yt_transcripts"
-        out.mkdir(parents=True, exist_ok=True)
-        path = out / f"{doc['video_id']}.json"
+        path = out or (_cache_dir() / "transcripts" / f"{doc['video_id']}.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
     except OSError:
         return None
 
 
-async def _file_in_grimoire(note: str, client_id: str) -> dict:
-    """Ensure the chapter, then capture the note into it.
-
-    Capture deliberately refuses to mint a chapter (a typo would silently
-    become one), so the chapter is created first; a 409 means a previous cast
-    already made it and is exactly as good as a 200.
-    """
-    async with app_sdk.client(timeout=30.0) as client:
-        made = await client.post("/api/grimoire/chapters", json={
-            "name": CHAPTER,
-            "description": CHAPTER_DESCRIPTION,
-            "icon": CHAPTER_ICON,
-        })
-        if made.status_code not in (200, 409):
-            raise RuntimeError(_http_error(f"could not create the {CHAPTER} chapter", made))
-
-        captured = await client.post("/api/grimoire/capture", json={
-            "content": note,
-            "chapter": CHAPTER,
-            "type": "log",
-            "client_id": client_id,
-        })
-        if captured.status_code != 200:
-            raise RuntimeError(_http_error("could not save the transcript", captured))
-        return captured.json().get("entry") or {}
-
-
-def _http_error(what: str, response) -> str:
-    """A failure the user can act on — especially the 401, which is the
-    platform's own loopback token and not a model credential. Naming the
-    right secret is the whole point: guessing wrong sends someone off
-    regenerating a Claude subscription token that had nothing to do with it.
-    """
-    if response.status_code == 401:
-        return (
-            f"{what}: the loopback API rejected wand's token (401). Reset it with "
-            "`wizard secret set WIZARD_API_TOKEN` and restart the server. (This "
-            "spell reads no model credential — a Claude token cannot cause this.)"
-        )
-    return f"{what}: grimoire returned {response.status_code} {response.text[:200]}"
-
-
-class YtTranscribeParams(BaseModel):
-    url: str = Field(
-        min_length=8, max_length=2000, pattern=r"^https?://",
-        description="YouTube video URL",
-    )
-    lang: str = Field(
-        default="en", max_length=12, pattern=r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})?$",
-        description="Caption language (default: en)",
-    )
-
-    @field_validator("url")
-    @classmethod
-    def _is_a_youtube_video(cls, raw: str) -> str:
-        """The handler's own check, run early enough that a Vimeo link is a 422
-        under the form field instead of a job that fails four seconds in."""
-        _video_id(raw)
-        return raw
-
-
-@spell(
-    "yt_transcribe",
-    "Transcribe a YouTube video — its captions when it has them, whisper on "
-    f"the audio when it doesn't. JSON out, filed in Grimoire's {CHAPTER} "
-    "chapter with timestamps",
-    YtTranscribeParams,
-)
-def yt_transcribe(p: YtTranscribeParams, progress) -> str:
-    video_id = _video_id(p.url)  # rejects non-YouTube before any network work
-    progress(f"fetching {p.lang} captions for {video_id}")
+def yt_transcribe(url: str, lang: str, progress, out: Optional[Path] = None) -> str:
+    """Transcribe ``url``. Return the title and the spoken text."""
+    _check(url, lang)
+    video_id = _video_id(url)
+    progress(f"fetching {lang} captions for {video_id}")
 
     with tempfile.TemporaryDirectory(prefix="yt_transcribe-") as tmp:
         workdir = Path(tmp)
         try:
-            _fetch_captions(p.url, p.lang, workdir, progress)
-            subtitles = _pick_subtitles(workdir, video_id, p.lang)
+            _fetch_captions(url, lang, workdir, progress)
+            subtitles = _pick_subtitles(workdir, video_id, lang)
         except _NoCaptions as gap:
-            # Tier 0 is genuinely out — not broken, out.
             source, lang = "audio", "en"
             progress(f"{gap} — transcribing the audio with whisper {_WHISPER_LABEL}")
-            audio = _download_audio(p.url, workdir, video_id, progress)
-            info = _info(workdir, video_id)  # this run wrote its own sidecar
+            audio = _download_audio(url, workdir, video_id, progress)
+            info = _info(workdir, video_id)
             progress(f"transcribing {audio.stat().st_size / 1e6:.1f} MB of audio")
             segments = _whisper(audio, workdir, info.get("duration"), progress)
         else:
@@ -610,37 +483,40 @@ def yt_transcribe(p: YtTranscribeParams, progress) -> str:
         raise RuntimeError(f"the {held}")
 
     doc = _document(
-        url=p.url, video_id=video_id, info=info, lang=lang,
+        url=url, video_id=video_id, info=info, lang=lang,
         segments=segments, source=source,
     )
     spoken = _clock(segments[-1]["end"])
     progress(f"{len(segments)} cues, {len(doc['text']):,} characters over {spoken}")
 
-    archived = _archive(doc)
-    if archived is not None:
-        doc["archive_path"] = str(archived)
+    saved = _write_json(doc, out)
+    if saved is not None:
+        progress(f"wrote {saved}")
 
-    progress(f"filing in grimoire/{CHAPTER}")
-    # The handler runs in the worker's thread pool, so there is no loop in
-    # this thread for asyncio.run to conflict with.
-    entry = asyncio.run(_file_in_grimoire(
-        _note(doc), f"wand-yt:{video_id}:{int(time.time())}"
-    ))
-    doc["grimoire"] = {
-        "chapter": entry.get("chapter") or CHAPTER,
-        "entry_id": entry.get("id", ""),
-    }
-    if archived is not None:
-        _archive(doc)  # re-write with the entry id recorded
+    return _note(doc)
 
-    how = f"whisper {_WHISPER_LABEL}" if source == "audio" else f"{lang} captions"
-    app_sdk.event("wand.yt_transcribe", {
-        "video_id": video_id,
-        "title": doc["title"],
-        "language": lang,
-        "source": source,
-        "segments": len(segments),
-        "saved": True,
-        "text": f"Transcribed “{doc['title']}” from {how} — {len(segments)} cues over {spoken}",
-    })
-    return f"{doc['title']}\n{doc['text']}"
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Read the CLI args, transcribe, and print the text."""
+    parser = argparse.ArgumentParser(description="Transcribe a YouTube video.")
+    parser.add_argument("url", help="YouTube video URL")
+    parser.add_argument("--lang", default="en", help="Caption language (default: en)")
+    parser.add_argument("--out", type=Path, help="JSON output path")
+    args = parser.parse_args(argv)
+
+    def progress(msg: str) -> None:
+        print(msg, file=sys.stderr)
+
+    try:
+        text = yt_transcribe(args.url, args.lang, progress, args.out)
+    except (ValueError, RuntimeError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
