@@ -1,0 +1,24 @@
+{
+  "kind": "tool",
+  "name": "add-music",
+  "description": "Download audio from a URL into a Navidrome-layout music library as tagged FLAC, splitting chapters and playlists.",
+  "tags": [
+    "wizardos",
+    "wand",
+    "spell"
+  ],
+  "dependencies": [
+    "github.com/etiennedoidic/wizard-apps//apps/wand@v0.1.0"
+  ],
+  "requires": [
+    "wizardos",
+    "yt-dlp",
+    "ffmpeg",
+    "mutagen"
+  ],
+  "permissions": [
+    "net",
+    "exec",
+    "fs.write"
+  ]
+}

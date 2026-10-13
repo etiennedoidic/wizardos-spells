@@ -1,0 +1,23 @@
+{
+  "kind": "tool",
+  "name": "yt-transcribe",
+  "description": "A YouTube video's transcript as timestamped JSON, from its captions or whisper as a fallback, filed as a Grimoire note.",
+  "tags": [
+    "wizardos",
+    "wand",
+    "spell"
+  ],
+  "dependencies": [
+    "github.com/etiennedoidic/wizard-apps//apps/wand@v0.1.0"
+  ],
+  "requires": [
+    "wizardos",
+    "yt-dlp",
+    "whisper-cli"
+  ],
+  "permissions": [
+    "net",
+    "exec",
+    "tools.call:grimoire"
+  ]
+}
